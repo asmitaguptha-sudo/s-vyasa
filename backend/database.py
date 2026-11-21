@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS users (
     phone TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     shop_name TEXT NOT NULL,
+    password_hash TEXT,
     voice_enrolled BOOLEAN NOT NULL DEFAULT 0,
     claim_token_hash TEXT,
     status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'SUSPENDED', 'BOOTSTRAP_LOCKED')),
@@ -158,6 +159,15 @@ CREATE TABLE IF NOT EXISTS voice_identities (
     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 
+-- 10. Login attempts table for persistent rate limiting
+CREATE TABLE IF NOT EXISTS login_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    ip_address TEXT,
+    attempted_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    success BOOLEAN NOT NULL
+);
+
 -- Performance and lookup composite indexes
 CREATE INDEX IF NOT EXISTS idx_customers_name ON customers (user_id, name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_customer_aliases_alias ON customer_aliases (user_id, alias COLLATE NOCASE);
@@ -176,6 +186,9 @@ CREATE INDEX IF NOT EXISTS idx_cust_proposals_phone ON pending_customer_proposal
 CREATE INDEX IF NOT EXISTS idx_cust_proposals_expiry ON pending_customer_proposals (status, expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_cust_proposals_idempotency ON pending_customer_proposals (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions (token_hash, revoked_at, expires_at);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_phone_time ON login_attempts (phone, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time ON login_attempts (ip_address, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_phone_ip ON login_attempts (phone, ip_address, attempted_at);
 """
 
 
@@ -262,8 +275,8 @@ def run_migrations(conn: sqlite3.Connection, db_path: Optional[str] = None) -> N
     """
     applied = get_applied_migrations(conn)
 
-    # If Version 2 (multi-merchant composite schema) is already applied, nothing to do
-    if 2 in applied:
+    # If Version 3 is already applied, nothing to do
+    if 3 in applied:
         return
 
     # Check if this is a fresh database (no customers table exists yet)
@@ -283,16 +296,19 @@ def run_migrations(conn: sqlite3.Connection, db_path: Optional[str] = None) -> N
             """)
         cursor.execute("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (1, 'v1_baseline');")
         cursor.execute("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'v2_multi_merchant_composite');")
+        cursor.execute("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (3, 'v3_user_credentials_and_rate_limiting');")
         return
 
-    # Existing database: inspect if customers already has user_id and composite constraint
-    cust_cols = {r["name"] for r in cursor.execute("PRAGMA table_info(customers)").fetchall()}
-    if "user_id" in cust_cols and 2 in applied:
-        return
+    # Existing database:
+    if 2 not in applied:
+        _run_v2_migration(conn, db_path)
 
-    # -------------------------------------------------------------------------
-    # Version 2 Migration: Table-Rebuild Migration to Composite Multi-Merchant Schema
-    # -------------------------------------------------------------------------
+    _run_v3_migration(conn)
+
+
+def _run_v2_migration(conn: sqlite3.Connection, db_path: Optional[str] = None) -> None:
+    """Execute Version 2 Table-Rebuild Migration to Composite Multi-Merchant Schema."""
+    cust_cols = {r["name"] for r in conn.execute("PRAGMA table_info(customers)").fetchall()}
     bak_path = create_backup_file(db_path) if db_path else None
 
     # Step 1: SQLite requires PRAGMA foreign_keys = OFF outside the transaction for table rebuilds
@@ -601,6 +617,50 @@ def run_migrations(conn: sqlite3.Connection, db_path: Optional[str] = None) -> N
                 os.remove(bak_path)
             except OSError:
                 pass
+
+
+def _run_v3_migration(conn: sqlite3.Connection) -> None:
+    """Execute Version 3 Migration: Add Credentials to Users & Persistent Rate Limiting."""
+    applied = get_applied_migrations(conn)
+    if 3 in applied:
+        return
+
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+
+        # 1. Add password_hash column to users if missing
+        user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users);").fetchall()}
+        if "password_hash" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT;")
+
+        # 2. Create login_attempts table if missing
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                ip_address TEXT,
+                attempted_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                success BOOLEAN NOT NULL
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_login_attempts_phone_time ON login_attempts (phone, attempted_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time ON login_attempts (ip_address, attempted_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_login_attempts_phone_ip ON login_attempts (phone, ip_address, attempted_at);")
+
+        # 3. Verify Foreign Key Integrity
+        violations = conn.execute("PRAGMA foreign_key_check;").fetchall()
+        if violations:
+            raise RuntimeError(f"Foreign key check failed in v3 migration: {violations}")
+
+        # 4. Record migration completion
+        conn.execute("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (1, 'v1_baseline');")
+        conn.execute("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'v2_multi_merchant_composite');")
+        conn.execute("INSERT INTO schema_migrations (version, name) VALUES (3, 'v3_user_credentials_and_rate_limiting');")
+
+        conn.execute("COMMIT;")
+    except BaseException as exc:
+        conn.execute("ROLLBACK;")
+        raise exc
 
 
 def init_db(db_path: Optional[str] = None) -> None:

@@ -8,11 +8,29 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 import sqlite3
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.auth import (
+    AuthenticationError,
+    RateLimitExceededError,
+    authenticate_merchant,
+    get_client_ip,
+    get_current_merchant,
+    register_merchant,
+    revoke_session,
+)
+from backend.auth_schemas import (
+    LogoutResponse,
+    MerchantLoginRequest,
+    MerchantLoginResponse,
+    MerchantProfileResponse,
+    MerchantRegisterRequest,
+    MerchantRegisterResponse,
+)
 from backend.config import APP_NAME, APP_VERSION
 from backend.database import get_db, init_db
+from backend.models import User
 from backend.schemas import (
     AiTransactionProposal,
     CreditCreate,
@@ -79,6 +97,142 @@ def health_check(db: sqlite3.Connection = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# Merchant Authentication (Stage 2B)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/auth/register",
+    response_model=MerchantRegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Merchant Authentication"],
+    summary="Register a new merchant account",
+)
+def register_merchant_endpoint(
+    payload: MerchantRegisterRequest,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Register a new merchant with normalized phone, shop details, and Argon2id PIN.
+    Returns authenticated session token on success.
+    """
+    try:
+        user, raw_token, expires_at = register_merchant(
+            db,
+            phone=payload.phone,
+            name=payload.name,
+            shop_name=payload.shop_name,
+            pin=payload.pin,
+        )
+        return MerchantRegisterResponse(
+            user_id=user.user_id,
+            phone=user.phone,
+            name=user.name,
+            shop_name=user.shop_name,
+            status=user.status,
+            token=raw_token,
+            token_type="Bearer",
+            expires_at=expires_at,
+        )
+    except ValueError as ve:
+        err_msg = str(ve)
+        if "already exists" in err_msg or "reserved" in err_msg:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=err_msg)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err_msg)
+
+
+@app.post(
+    "/auth/login",
+    response_model=MerchantLoginResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Merchant Authentication"],
+    summary="Authenticate merchant and obtain session token",
+)
+def login_merchant_endpoint(
+    payload: MerchantLoginRequest,
+    request: Request,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Authenticate merchant using normalized phone and 6-digit PIN.
+    Applies persistent rate limiting before expensive Argon2id hash checks.
+    """
+    client_ip = get_client_ip(request)
+    try:
+        user, raw_token, expires_at = authenticate_merchant(
+            db,
+            phone=payload.phone,
+            pin=payload.pin,
+            ip_address=client_ip,
+        )
+        return MerchantLoginResponse(
+            token=raw_token,
+            token_type="Bearer",
+            expires_at=expires_at,
+            user=MerchantProfileResponse.model_validate(user.to_dict()),
+        )
+    except RateLimitExceededError as rle:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(rle))
+    except AuthenticationError as ae:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(ae))
+
+
+@app.post(
+    "/auth/logout",
+    response_model=LogoutResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Merchant Authentication"],
+    summary="Revoke active merchant session",
+)
+def logout_merchant_endpoint(
+    authorization: Optional[str] = Header(None),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Revoke bearer session token in SQLite.
+    Subsequent requests with this token will be rejected.
+    """
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization header.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    parts = authorization.strip().split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Authorization header format. Expected 'Bearer <token>'.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    raw_token = parts[1]
+    revoked = revoke_session(db, raw_token)
+    if not revoked:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session not found or already revoked.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return LogoutResponse(message="Logged out successfully.")
+
+
+@app.get(
+    "/auth/me",
+    response_model=MerchantProfileResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Merchant Authentication"],
+    summary="Get authenticated merchant profile",
+)
+def get_current_merchant_profile_endpoint(
+    current_user: User = Depends(get_current_merchant),
+):
+    """
+    Retrieve profile of currently authenticated merchant.
+    Identity is derived strictly from verified session token in database.
+    """
+    return MerchantProfileResponse.model_validate(current_user.to_dict())
+
+
+# ---------------------------------------------------------------------------
 # Customer Management & Duplicate Handling
 # ---------------------------------------------------------------------------
 
@@ -90,9 +244,11 @@ def health_check(db: sqlite3.Connection = Depends(get_db)):
 )
 def create_customer_endpoint(
     customer_in: CustomerCreate,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """Create a new customer with canonical name and shop-specific aliases."""
+    db.current_user_id = current_user.user_id
     try:
         return customer_service.create_customer(db, customer_in)
     except ValueError as ve:
@@ -103,9 +259,11 @@ def create_customer_endpoint(
 def list_customers_endpoint(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """List all registered customers with pagination."""
+    db.current_user_id = current_user.user_id
     return customer_service.list_customers(db, limit=limit, offset=offset)
 
 
@@ -116,12 +274,14 @@ def list_customers_endpoint(
 )
 def lookup_customer_endpoint(
     q: str = Query(..., min_length=1, description="Customer name, alias, or composite search term"),
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
     Lookup customer by name or alias with intelligent duplicate resolution.
     Returns EXACT_MATCH, AMBIGUOUS_MATCH with spoken clarification prompt, or NOT_FOUND.
     """
+    db.current_user_id = current_user.user_id
     return customer_service.lookup_customer(db, query=q)
 
 
@@ -132,9 +292,11 @@ def lookup_customer_endpoint(
 )
 def get_customer_endpoint(
     customer_id: int,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
-    """Retrieve customer details by ID."""
+    """Retrieve customer details by ID. Returns 404 for cross-merchant access."""
+    db.current_user_id = current_user.user_id
     customer = customer_service.get_customer_by_id(db, customer_id)
     if not customer:
         raise HTTPException(
@@ -158,6 +320,7 @@ def get_customer_endpoint(
 def record_credit_endpoint(
     customer_id: int,
     payload: CreditCreate,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
@@ -165,6 +328,7 @@ def record_credit_endpoint(
     Accepts customer ID and amount (in rupees or integer paise).
     Validates customer existence and writes persistently under BEGIN IMMEDIATE.
     """
+    db.current_user_id = current_user.user_id
     try:
         amount_paise = payload.resolve_amount_paise()
         tx = ledger.record_credit(
@@ -193,6 +357,7 @@ def record_credit_endpoint(
 def record_payment_endpoint(
     customer_id: int,
     payload: PaymentCreate,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
@@ -200,6 +365,7 @@ def record_payment_endpoint(
     Accepts customer ID, amount, and optional payment method (CASH, UPI, OTHER).
     Decreases outstanding balance under BEGIN IMMEDIATE.
     """
+    db.current_user_id = current_user.user_id
     try:
         amount_paise = payload.resolve_amount_paise()
         tx = ledger.record_payment(
@@ -227,12 +393,14 @@ def record_payment_endpoint(
 )
 def get_customer_balance_endpoint(
     customer_id: int,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
     Calculate customer's balance as sum of committed CREDIT entries minus committed PAYMENT entries.
     Integer paise only. Database is the authoritative source of truth.
     """
+    db.current_user_id = current_user.user_id
     try:
         return ledger.get_customer_balance(db, customer_id)
     except ledger.CustomerNotFoundError as ce:
@@ -249,12 +417,14 @@ def get_customer_transactions_endpoint(
     customer_id: int,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
     Retrieve chronological transaction history for an individual customer.
     Preserves all historical entries, statuses, and reversal links.
     """
+    db.current_user_id = current_user.user_id
     try:
         txs = ledger.get_customer_transactions(db, customer_id, limit=limit, offset=offset)
         return [t.to_dict() for t in txs]
@@ -271,6 +441,7 @@ def get_customer_transactions_endpoint(
 def reverse_transaction_endpoint(
     transaction_id: int,
     payload: Optional[ReversalCreate] = None,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
@@ -278,6 +449,7 @@ def reverse_transaction_endpoint(
     Preserves original entry with status REVERSED, appends an opposite compensating entry,
     and links reversed_transaction_id. Prevents duplicate reversals via UNIQUE constraint.
     """
+    db.current_user_id = current_user.user_id
     reason = payload.reason if payload else None
     key = payload.idempotency_key if payload else None
     try:
@@ -302,6 +474,7 @@ def reverse_transaction_endpoint(
 )
 def propose_ai_contract_endpoint(
     proposal: AiTransactionProposal,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
@@ -319,6 +492,7 @@ def propose_ai_contract_endpoint(
     - If exact match: generates a backend-controlled pending proposal in SQLite with a confirmation prompt.
     Does NOT write to the ledger.
     """
+    db.current_user_id = current_user.user_id
     lookup = customer_service.lookup_customer(db, proposal.customer_name)
     if lookup.status == "AMBIGUOUS_MATCH":
         raise HTTPException(
@@ -374,12 +548,14 @@ def propose_ai_contract_endpoint(
 )
 def validate_ai_contract_endpoint(
     proposal: AiTransactionProposal,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
     Validates incoming proposal against the strict 5-field contract (extra fields forbidden).
     Resolves customer lookup without committing any ledger writes.
     """
+    db.current_user_id = current_user.user_id
     lookup = customer_service.lookup_customer(db, proposal.customer_name)
     return {
         "contract_valid": True,
@@ -400,6 +576,7 @@ def validate_ai_contract_endpoint(
 )
 def confirm_proposal_endpoint(
     proposal_id: str,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
@@ -408,6 +585,7 @@ def confirm_proposal_endpoint(
     Idempotent: repeating confirmation for the same proposal_id returns the existing
     committed transaction without duplicating entries.
     """
+    db.current_user_id = current_user.user_id
     try:
         res = ledger.confirm_pending_proposal(db, proposal_id)
         return res
@@ -424,9 +602,11 @@ def confirm_proposal_endpoint(
 )
 def cancel_proposal_endpoint(
     proposal_id: str,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """Cancel a pending proposal (merchant said 'Nahi, rehne do')."""
+    db.current_user_id = current_user.user_id
     try:
         return ledger.cancel_pending_proposal(db, proposal_id)
     except ledger.ProposalNotFoundError as pe:
@@ -442,6 +622,7 @@ def cancel_proposal_endpoint(
 )
 def commit_ai_contract_endpoint(
     proposal: AiTransactionProposal,
+    current_user: User = Depends(get_current_merchant),
     db: sqlite3.Connection = Depends(get_db),
 ):
     """
@@ -450,6 +631,7 @@ def commit_ai_contract_endpoint(
     Rejects commit if confirmation_required is True.
     Transaction must be confirmed by user through the proposal workflow.
     """
+    db.current_user_id = current_user.user_id
     if proposal.confirmation_required:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

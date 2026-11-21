@@ -12,9 +12,11 @@ from backend.main import app
 
 @pytest.fixture
 def test_client():
-    """Provides a TestClient with an isolated in-memory database overriding get_db."""
+    """
+    Provides an authenticated TestClient backed by an isolated in-memory database.
+    Registers a test merchant and returns a client pre-loaded with a valid Bearer token.
+    """
     conn = get_db_connection(":memory:")
-    conn.current_user_id = 1  # Explicitly scope test client to test merchant 1
     conn.executescript(SCHEMA_SQL)
     run_migrations(conn)
 
@@ -26,6 +28,18 @@ def test_client():
 
     app.dependency_overrides[get_db] = override_get_db
     client = TestClient(app)
+
+    # Register a test merchant and capture their Bearer token
+    reg = client.post("/auth/register", json={
+        "phone": "9000000002",
+        "name": "Test Merchant M2",
+        "shop_name": "Test Shop M2",
+        "pin": "246813",
+    })
+    assert reg.status_code == 201, f"Fixture registration failed: {reg.json()}"
+    token = reg.json()["token"]
+    client.headers.update({"Authorization": f"Bearer {token}"})
+
     yield client
     app.dependency_overrides.clear()
     conn.close()

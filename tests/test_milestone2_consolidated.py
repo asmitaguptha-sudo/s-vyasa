@@ -20,13 +20,13 @@ from backend.schemas import CustomerCreate
 from backend.main import app
 
 
+
 @pytest.fixture
 def test_client():
-    """Provides a TestClient with an isolated in-memory database overriding get_db."""
+    """Provides an authenticated TestClient with an isolated in-memory database."""
     conn = get_db_connection(":memory:")
     conn.executescript(SCHEMA_SQL)
     run_migrations(conn)
-    conn.current_user_id = 1
 
     def override_get_db():
         try:
@@ -36,9 +36,28 @@ def test_client():
 
     app.dependency_overrides[get_db] = override_get_db
     client = TestClient(app)
+
+    # Register a test merchant and obtain a real session token.
+    register_response = client.post(
+        "/auth/register",
+        json={
+            "phone": "9876543210",
+            "name": "Test Merchant",
+            "shop_name": "Test Shop",
+            "pin": "482691",
+        },
+    )
+
+    assert register_response.status_code == 201, register_response.text
+
+    token = register_response.json()["token"]
+    client.headers.update({"Authorization": f"Bearer {token}"})
+
     yield client
+
     app.dependency_overrides.clear()
     conn.close()
+
 
 
 # ---------------------------------------------------------------------------

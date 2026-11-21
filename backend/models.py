@@ -196,3 +196,65 @@ class PendingProposal:
             "committed_transaction_id": self.committed_transaction_id,
             "created_at": self.created_at,
         }
+
+
+@dataclass
+class User:
+    user_id: int
+    phone: str
+    name: str
+    shop_name: str
+    password_hash: Optional[str] = None
+    voice_enrolled: bool = False
+    claim_token_hash: Optional[str] = None
+    status: str = "ACTIVE"
+    created_at: Optional[str] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "User":
+        return cls(
+            user_id=row["user_id"],
+            phone=row["phone"],
+            name=row["name"],
+            shop_name=row["shop_name"],
+            password_hash=row["password_hash"] if "password_hash" in row.keys() else None,
+            voice_enrolled=bool(row["voice_enrolled"]) if "voice_enrolled" in row.keys() else False,
+            claim_token_hash=row["claim_token_hash"] if "claim_token_hash" in row.keys() else None,
+            status=row["status"] if "status" in row.keys() else "ACTIVE",
+            created_at=row["created_at"] if "created_at" in row.keys() else None,
+        )
+
+    def to_dict(self) -> dict:
+        """Returns safe user representation without credentials or secrets."""
+        return {
+            "user_id": self.user_id,
+            "phone": self.phone,
+            "name": self.name,
+            "shop_name": self.shop_name,
+            "voice_enrolled": self.voice_enrolled,
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class Session:
+    session_id: str
+    user_id: int
+    token_hash: str
+    auth_method: str
+    expires_at: str
+    revoked_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Session":
+        return cls(
+            session_id=row["session_id"],
+            user_id=row["user_id"],
+            token_hash=row["token_hash"],
+            auth_method=row["auth_method"],
+            expires_at=row["expires_at"],
+            revoked_at=row["revoked_at"] if "revoked_at" in row.keys() else None,
+            created_at=row["created_at"] if "created_at" in row.keys() else None,
+        )
