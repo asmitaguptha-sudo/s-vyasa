@@ -15,6 +15,7 @@ def db():
     conn = get_db_connection(":memory:")
     conn.executescript(SCHEMA_SQL)
     conn.commit()
+    conn.current_user_id = 1
     yield conn
     conn.close()
 

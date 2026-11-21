@@ -13,6 +13,7 @@ from backend.main import app
 def test_client():
     """Provides a TestClient with an isolated in-memory database overriding get_db."""
     conn = get_db_connection(":memory:")
+    conn.current_user_id = 1  # Explicitly scope test client to test merchant 1
     conn.executescript(SCHEMA_SQL)
     conn.commit()
 

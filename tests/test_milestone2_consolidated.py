@@ -26,6 +26,7 @@ def test_client():
     conn = get_db_connection(":memory:")
     conn.executescript(SCHEMA_SQL)
     run_migrations(conn)
+    conn.current_user_id = 1
 
     def override_get_db():
         try:
@@ -271,6 +272,7 @@ def test_invalid_paise_values_rejected():
     conn = get_db_connection(":memory:")
     conn.executescript(SCHEMA_SQL)
     run_migrations(conn)
+    conn.current_user_id = 1
 
     cust = customer_service.create_customer(conn, CustomerCreate(name="TestCust"))
     cid = cust.customer_id
@@ -303,14 +305,18 @@ def test_concurrent_writes_thread_safety():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
 
+    init_conn = None
+    verify_conn = None
     try:
         # Initialize database
         init_conn = get_db_connection(db_path)
         init_conn.executescript(SCHEMA_SQL)
         run_migrations(init_conn)
+        init_conn.current_user_id = 1
         cust = customer_service.create_customer(init_conn, CustomerCreate(name="ConcurCust"))
         cid = cust.customer_id
         init_conn.close()
+        init_conn = None
 
         num_threads = 10
         credits_per_thread = 2
@@ -318,6 +324,7 @@ def test_concurrent_writes_thread_safety():
 
         def worker(worker_idx):
             thread_conn = get_db_connection(db_path)
+            thread_conn.current_user_id = 1
             for j in range(credits_per_thread):
                 key = f"thread-{worker_idx}-tx-{j}"
                 ledger.record_credit(thread_conn, customer_id=cid, amount_paise=amount_each, idempotency_key=key)
@@ -330,12 +337,18 @@ def test_concurrent_writes_thread_safety():
 
         # Check final balance
         verify_conn = get_db_connection(db_path)
+        verify_conn.current_user_id = 1
         bal = ledger.get_customer_balance(verify_conn, cid)
         expected_total = num_threads * credits_per_thread * amount_each  # 10 * 2 * 1000 = 20,000 paise (₹200)
         assert bal["balance_paise"] == expected_total
         assert bal["transaction_count"] == num_threads * credits_per_thread
         verify_conn.close()
+        verify_conn = None
     finally:
+        if init_conn:
+            init_conn.close()
+        if verify_conn:
+            verify_conn.close()
         if os.path.exists(db_path):
             os.remove(db_path)
 

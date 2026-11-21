@@ -27,6 +27,7 @@ def db():
     conn = get_db_connection(":memory:")
     conn.executescript(SCHEMA_SQL)
     run_migrations(conn)
+    conn.current_user_id = 1
     yield conn
     conn.close()
 
@@ -242,20 +243,25 @@ def test_persistence_across_database_reconnection():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
 
+    conn1 = None
+    conn2 = None
     try:
         # Step 1: Open connection, initialize schema, insert customer and transactions
         conn1 = get_db_connection(db_path)
         conn1.executescript(SCHEMA_SQL)
         run_migrations(conn1)
+        conn1.current_user_id = 1
 
         cust = customer_service.create_customer(conn1, CustomerCreate(name="Lakshmi", alias="Store"))
         cid = cust.customer_id
         ledger.record_credit(conn1, customer_id=cid, amount_paise=75000, item="Silk Saree")
         ledger.record_payment(conn1, customer_id=cid, amount_paise=25000, payment_method="CASH")
         conn1.close()
+        conn1 = None
 
         # Step 2: Open completely new connection to the same SQLite file
         conn2 = get_db_connection(db_path)
+        conn2.current_user_id = 1
         bal = ledger.get_customer_balance(conn2, cid)
         assert bal["balance_paise"] == 50000  # 750 - 250 = 500 rupees
         assert bal["balance_rupees"] == 500.0
@@ -263,6 +269,11 @@ def test_persistence_across_database_reconnection():
         history = ledger.get_customer_transactions(conn2, cid)
         assert len(history) == 2
         conn2.close()
+        conn2 = None
     finally:
+        if conn1:
+            conn1.close()
+        if conn2:
+            conn2.close()
         if os.path.exists(db_path):
             os.remove(db_path)

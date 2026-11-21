@@ -15,6 +15,7 @@ def in_memory_db():
     conn.executescript(SCHEMA_SQL)
     run_migrations(conn)
     conn.commit()
+    conn.current_user_id = 1
     yield conn
     conn.close()
 
@@ -52,13 +53,13 @@ def test_customer_deletion_protection_with_transactions(in_memory_db):
     Verify that ON DELETE RESTRICT prevents deleting a customer who has financial transactions.
     """
     cursor = in_memory_db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Ramesh')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Ramesh')")
     customer_id = cursor.lastrowid
 
     cursor.execute(
         """
-        INSERT INTO transactions (customer_id, type, amount_paise)
-        VALUES (?, 'CREDIT', 30000)
+        INSERT INTO transactions (user_id, customer_id, type, amount_paise)
+        VALUES (1, ?, 'CREDIT', 30000)
         """,
         (customer_id,),
     )
@@ -76,13 +77,13 @@ def test_customer_deletion_protection_with_promises(in_memory_db):
     Verify that ON DELETE RESTRICT prevents deleting a customer who has recorded promises.
     """
     cursor = in_memory_db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Suresh')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Suresh')")
     customer_id = cursor.lastrowid
 
     cursor.execute(
         """
-        INSERT INTO promises (customer_id, amount_paise, due_date)
-        VALUES (?, 50000, '2026-11-28')
+        INSERT INTO promises (user_id, customer_id, amount_paise, due_date)
+        VALUES (1, ?, 50000, '2026-11-28')
         """,
         (customer_id,),
     )
@@ -99,11 +100,11 @@ def test_customer_deletion_cascades_aliases_when_no_transactions(in_memory_db):
     and their aliases in customer_aliases are cleanly cascaded.
     """
     cursor = in_memory_db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Ravi')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Ravi')")
     customer_id = cursor.lastrowid
 
     cursor.execute(
-        "INSERT INTO customer_aliases (customer_id, alias) VALUES (?, 'Tea Shop')",
+        "INSERT INTO customer_aliases (user_id, customer_id, alias) VALUES (1, ?, 'Tea Shop')",
         (customer_id,),
     )
     in_memory_db.commit()
@@ -123,14 +124,14 @@ def test_reversal_unique_constraint_prevents_duplicate_reversals(in_memory_db):
     Verify that reversed_transaction_id UNIQUE prevents reversing the same transaction twice.
     """
     cursor = in_memory_db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Ramesh')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Ramesh')")
     customer_id = cursor.lastrowid
 
     # Original transaction (T1)
     cursor.execute(
         """
-        INSERT INTO transactions (customer_id, type, amount_paise, status)
-        VALUES (?, 'CREDIT', 34000, 'COMMITTED')
+        INSERT INTO transactions (user_id, customer_id, type, amount_paise, status)
+        VALUES (1, ?, 'CREDIT', 34000, 'COMMITTED')
         """,
         (customer_id,),
     )
@@ -140,8 +141,8 @@ def test_reversal_unique_constraint_prevents_duplicate_reversals(in_memory_db):
     # First compensating reversal entry (T2 pointing to T1)
     cursor.execute(
         """
-        INSERT INTO transactions (customer_id, type, amount_paise, status, reversed_transaction_id)
-        VALUES (?, 'PAYMENT', 34000, 'COMMITTED', ?)
+        INSERT INTO transactions (user_id, customer_id, type, amount_paise, status, reversed_transaction_id)
+        VALUES (1, ?, 'PAYMENT', 34000, 'COMMITTED', ?)
         """,
         (customer_id, t1_id),
     )
@@ -151,8 +152,8 @@ def test_reversal_unique_constraint_prevents_duplicate_reversals(in_memory_db):
     with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise, status, reversed_transaction_id)
-            VALUES (?, 'PAYMENT', 34000, 'COMMITTED', ?)
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise, status, reversed_transaction_id)
+            VALUES (1, ?, 'PAYMENT', 34000, 'COMMITTED', ?)
             """,
             (customer_id, t1_id),
         )
@@ -162,14 +163,14 @@ def test_reversal_unique_constraint_prevents_duplicate_reversals(in_memory_db):
 def test_reversal_foreign_key_constraint(in_memory_db):
     """Verify that reversed_transaction_id must reference a valid transaction."""
     cursor = in_memory_db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Ramesh')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Ramesh')")
     customer_id = cursor.lastrowid
 
     with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise, reversed_transaction_id)
-            VALUES (?, 'PAYMENT', 34000, 999999)
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise, reversed_transaction_id)
+            VALUES (1, ?, 'PAYMENT', 34000, 999999)
             """,
             (customer_id,),
         )
@@ -179,13 +180,13 @@ def test_reversal_foreign_key_constraint(in_memory_db):
 def test_idempotency_key_uniqueness(in_memory_db):
     """Verify that idempotency_key prevents inserting duplicate transactions."""
     cursor = in_memory_db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Ramesh')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Ramesh')")
     customer_id = cursor.lastrowid
 
     cursor.execute(
         """
-        INSERT INTO transactions (customer_id, type, amount_paise, idempotency_key)
-        VALUES (?, 'CREDIT', 20000, 'voice-req-123')
+        INSERT INTO transactions (user_id, customer_id, type, amount_paise, idempotency_key)
+        VALUES (1, ?, 'CREDIT', 20000, 'voice-req-123')
         """,
         (customer_id,),
     )
@@ -194,8 +195,8 @@ def test_idempotency_key_uniqueness(in_memory_db):
     with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise, idempotency_key)
-            VALUES (?, 'CREDIT', 20000, 'voice-req-123')
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise, idempotency_key)
+            VALUES (1, ?, 'CREDIT', 20000, 'voice-req-123')
             """,
             (customer_id,),
         )
@@ -205,14 +206,14 @@ def test_idempotency_key_uniqueness(in_memory_db):
 def test_transaction_type_constraint(in_memory_db):
     """Verify check constraint rejects invalid transaction types."""
     cursor = in_memory_db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Test Customer')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Test Customer')")
     customer_id = cursor.lastrowid
 
     with pytest.raises(sqlite3.IntegrityError):
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise)
-            VALUES (?, 'INVALID_TYPE', 50000)
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise)
+            VALUES (1, ?, 'INVALID_TYPE', 50000)
             """,
             (customer_id,),
         )
@@ -222,14 +223,14 @@ def test_transaction_type_constraint(in_memory_db):
 def test_transaction_amount_constraint(in_memory_db):
     """Verify check constraint requires amount_paise > 0."""
     cursor = in_memory_db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Test Customer')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Test Customer')")
     customer_id = cursor.lastrowid
 
     with pytest.raises(sqlite3.IntegrityError):
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise)
-            VALUES (?, 'CREDIT', 0)
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise)
+            VALUES (1, ?, 'CREDIT', 0)
             """,
             (customer_id,),
         )

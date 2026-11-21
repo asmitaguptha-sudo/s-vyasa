@@ -1,47 +1,40 @@
 """
-Core Ledger Engine for Vaada Khata.
-Implements:
-1. Credit recording (Udhaar).
-2. Payment recording.
-3. Authoritative outstanding balance calculation (Source of Truth).
-4. Transaction history.
-5. Atomic writes using BEGIN IMMEDIATE and payload-bound idempotency.
-6. Safe additive compensating reversals.
-7. Backend-controlled pending proposals and explicit confirmation workflow.
+Core ledger operations and accounting rules for Vaada Khata.
+Strictly enforces:
+- Integer paise only: no floats, rounding, or fractions.
+- Double-entry / additive compensating reversals: original transactions are immutable.
+- Backend-authoritative balance: derived dynamically as sum(CREDIT) - sum(PAYMENT).
+- Multi-merchant account isolation with composite foreign keys and explicit user_id scoping.
+- Atomic write transactions under SQLite BEGIN IMMEDIATE.
 """
 
 from decimal import Decimal
 import sqlite3
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from backend.database import atomic
 from backend.models import PendingProposal, Transaction
-from backend.money import parse_rupees_to_paise
+from backend.schemas import ProposalConfirmResponse, ProposalResponse
 
 
 class LedgerError(Exception):
-    """Base exception for all ledger operations."""
+    """Base exception for all ledger-related domain errors."""
     pass
 
 
 class CustomerNotFoundError(LedgerError):
-    """Raised when customer ID does not exist."""
+    """Raised when customer ID is not found in database."""
     pass
 
 
 class TransactionNotFoundError(LedgerError):
-    """Raised when a transaction ID is not found."""
+    """Raised when transaction ID is not found in database."""
     pass
 
 
 class ProposalNotFoundError(LedgerError):
-    """Raised when a pending proposal ID is not found."""
-    pass
-
-
-class IdempotencyConflictError(LedgerError):
-    """Raised when an idempotency key is reused with a different payload."""
+    """Raised when pending proposal ID is not found."""
     pass
 
 
@@ -50,15 +43,24 @@ class DuplicateReversalError(LedgerError):
     pass
 
 
+class IdempotencyConflictError(LedgerError):
+    """Raised when an idempotency key is reused with mismatched parameters."""
+    pass
+
+
 class InvalidTransactionError(LedgerError):
     """Raised when transaction data violates business rules."""
     pass
 
 
-def _get_customer(conn: sqlite3.Connection, customer_id: int) -> sqlite3.Row:
-    """Fetch customer record or raise CustomerNotFoundError."""
+def _get_customer(conn: sqlite3.Connection, customer_id: int, user_id: Optional[int] = None) -> sqlite3.Row:
+    """Fetch customer record or raise CustomerNotFoundError. Validates user_id ownership."""
+    if user_id is None:
+        user_id = getattr(conn, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM customers WHERE customer_id = ?", (customer_id,))
+    cursor.execute("SELECT * FROM customers WHERE customer_id = ? AND user_id = ?", (customer_id, user_id))
     row = cursor.fetchone()
     if not row:
         raise CustomerNotFoundError(f"Customer with ID {customer_id} does not exist.")
@@ -71,6 +73,7 @@ def record_credit(
     amount_paise: int,
     item: Optional[str] = None,
     idempotency_key: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> Transaction:
     """
     Record customer credit (Udhaar).
@@ -84,14 +87,15 @@ def record_credit(
     clean_key = idempotency_key.strip() if idempotency_key else None
 
     with atomic(conn):
-        _get_customer(conn, customer_id)
+        cust = _get_customer(conn, customer_id, user_id=user_id)
+        resolved_user_id = cust["user_id"]
 
-        # Idempotency check: if key already exists, verify payload
+        # Idempotency check scoped to merchant: if key already exists, verify payload
         if clean_key:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM transactions WHERE idempotency_key = ?",
-                (clean_key,),
+                "SELECT * FROM transactions WHERE user_id = ? AND idempotency_key = ?",
+                (resolved_user_id, clean_key),
             )
             existing = cursor.fetchone()
             if existing:
@@ -109,13 +113,13 @@ def record_credit(
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise, item, status, idempotency_key)
-            VALUES (?, 'CREDIT', ?, ?, 'COMMITTED', ?)
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise, item, status, idempotency_key)
+            VALUES (?, ?, 'CREDIT', ?, ?, 'COMMITTED', ?)
             """,
-            (customer_id, amount_paise, clean_item, clean_key),
+            (resolved_user_id, customer_id, amount_paise, clean_item, clean_key),
         )
         tx_id = cursor.lastrowid
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = ?", (tx_id,))
+        cursor.execute("SELECT * FROM transactions WHERE user_id = ? AND transaction_id = ?", (resolved_user_id, tx_id))
         row = cursor.fetchone()
         return Transaction.from_row(row)
 
@@ -127,6 +131,7 @@ def record_payment(
     payment_method: Optional[str] = None,
     item: Optional[str] = None,
     idempotency_key: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> Transaction:
     """
     Record customer payment.
@@ -146,14 +151,15 @@ def record_payment(
     clean_key = idempotency_key.strip() if idempotency_key else None
 
     with atomic(conn):
-        _get_customer(conn, customer_id)
+        cust = _get_customer(conn, customer_id, user_id=user_id)
+        resolved_user_id = cust["user_id"]
 
-        # Idempotency check: if key already exists, verify payload
+        # Idempotency check scoped to merchant: if key already exists, verify payload
         if clean_key:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM transactions WHERE idempotency_key = ?",
-                (clean_key,),
+                "SELECT * FROM transactions WHERE user_id = ? AND idempotency_key = ?",
+                (resolved_user_id, clean_key),
             )
             existing = cursor.fetchone()
             if existing:
@@ -172,18 +178,22 @@ def record_payment(
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise, payment_method, item, status, idempotency_key)
-            VALUES (?, 'PAYMENT', ?, ?, ?, 'COMMITTED', ?)
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise, payment_method, item, status, idempotency_key)
+            VALUES (?, ?, 'PAYMENT', ?, ?, ?, 'COMMITTED', ?)
             """,
-            (customer_id, amount_paise, clean_method, clean_item, clean_key),
+            (resolved_user_id, customer_id, amount_paise, clean_method, clean_item, clean_key),
         )
         tx_id = cursor.lastrowid
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = ?", (tx_id,))
+        cursor.execute("SELECT * FROM transactions WHERE user_id = ? AND transaction_id = ?", (resolved_user_id, tx_id))
         row = cursor.fetchone()
         return Transaction.from_row(row)
 
 
-def get_customer_balance(conn: sqlite3.Connection, customer_id: int) -> Dict[str, Any]:
+def get_customer_balance(
+    conn: sqlite3.Connection,
+    customer_id: int,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     Calculate customer's authoritative outstanding balance directly from committed transactions in SQLite.
 
@@ -192,7 +202,9 @@ def get_customer_balance(conn: sqlite3.Connection, customer_id: int) -> Dict[str
 
     The database is the sole source of truth. Never trusts AI or cached balances.
     """
-    customer = _get_customer(conn, customer_id)
+    customer = _get_customer(conn, customer_id, user_id=user_id)
+    resolved_user_id = customer["user_id"]
+
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -201,9 +213,9 @@ def get_customer_balance(conn: sqlite3.Connection, customer_id: int) -> Dict[str
             COALESCE(SUM(CASE WHEN type = 'PAYMENT' THEN amount_paise ELSE 0 END), 0) AS total_payment_paise,
             COUNT(*) AS transaction_count
         FROM transactions
-        WHERE customer_id = ?
+        WHERE user_id = ? AND customer_id = ?
         """,
-        (customer_id,),
+        (resolved_user_id, customer_id),
     )
     row = cursor.fetchone()
     total_credit = row["total_credit_paise"]
@@ -224,22 +236,28 @@ def get_customer_balance(conn: sqlite3.Connection, customer_id: int) -> Dict[str
 
 
 def get_customer_transactions(
-    conn: sqlite3.Connection, customer_id: int, limit: int = 100, offset: int = 0
+    conn: sqlite3.Connection,
+    customer_id: int,
+    limit: int = 100,
+    offset: int = 0,
+    user_id: Optional[int] = None,
 ) -> List[Transaction]:
     """
     Retrieve chronological transaction history for an individual customer.
     All historical entries, reversals, and compensating rows are preserved.
     """
-    _get_customer(conn, customer_id)
+    cust = _get_customer(conn, customer_id, user_id=user_id)
+    resolved_user_id = cust["user_id"]
+
     cursor = conn.cursor()
     cursor.execute(
         """
         SELECT * FROM transactions
-        WHERE customer_id = ?
+        WHERE user_id = ? AND customer_id = ?
         ORDER BY transaction_date DESC, transaction_id DESC
         LIMIT ? OFFSET ?
         """,
-        (customer_id, limit, offset),
+        (resolved_user_id, customer_id, limit, offset),
     )
     rows = cursor.fetchall()
     return [Transaction.from_row(r) for r in rows]
@@ -250,6 +268,7 @@ def reverse_transaction(
     transaction_id: int,
     reason: Optional[str] = None,
     idempotency_key: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Perform a safe additive compensating reversal.
@@ -265,14 +284,20 @@ def reverse_transaction(
     clean_key = idempotency_key.strip() if idempotency_key else None
     clean_reason = reason.strip() if reason else None
 
+    if user_id is None:
+        user_id = getattr(conn, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
+
     with atomic(conn):
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = ?", (transaction_id,))
+        cursor.execute("SELECT * FROM transactions WHERE user_id = ? AND transaction_id = ?", (user_id, transaction_id))
         orig_row = cursor.fetchone()
         if not orig_row:
             raise TransactionNotFoundError(f"Transaction with ID {transaction_id} not found.")
 
         orig = Transaction.from_row(orig_row)
+        resolved_user_id = orig_row["user_id"]
 
         if orig.reversed_transaction_id is not None:
             raise InvalidTransactionError(
@@ -281,13 +306,13 @@ def reverse_transaction(
 
         # Check if already reversed (idempotent replay check)
         cursor.execute(
-            "SELECT * FROM transactions WHERE reversed_transaction_id = ?",
-            (transaction_id,),
+            "SELECT * FROM transactions WHERE user_id = ? AND reversed_transaction_id = ?",
+            (resolved_user_id, transaction_id),
         )
         existing_reversal = cursor.fetchone()
         if existing_reversal:
             comp_tx = Transaction.from_row(existing_reversal)
-            bal = get_customer_balance(conn, orig.customer_id)
+            bal = get_customer_balance(conn, orig.customer_id, user_id=resolved_user_id)
             return {
                 "reversed_transaction": orig.to_dict(),
                 "compensating_transaction": comp_tx.to_dict(),
@@ -303,20 +328,20 @@ def reverse_transaction(
         )
 
         cursor.execute(
-            "UPDATE transactions SET status = 'REVERSED' WHERE transaction_id = ?",
-            (transaction_id,),
+            "UPDATE transactions SET status = 'REVERSED' WHERE user_id = ? AND transaction_id = ?",
+            (resolved_user_id, transaction_id),
         )
 
         try:
             cursor.execute(
                 """
                 INSERT INTO transactions (
-                    customer_id, type, amount_paise, item, status,
+                    user_id, customer_id, type, amount_paise, item, status,
                     reversed_transaction_id, idempotency_key
                 )
-                VALUES (?, ?, ?, ?, 'COMMITTED', ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
                 """,
-                (orig.customer_id, comp_type, orig.amount_paise, comp_item, orig.transaction_id, clean_key),
+                (resolved_user_id, orig.customer_id, comp_type, orig.amount_paise, comp_item, orig.transaction_id, clean_key),
             )
         except sqlite3.IntegrityError as ie:
             if "UNIQUE constraint failed" in str(ie) and "reversed_transaction_id" in str(ie):
@@ -324,15 +349,15 @@ def reverse_transaction(
             raise
 
         comp_id = cursor.lastrowid
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = ?", (comp_id,))
+        cursor.execute("SELECT * FROM transactions WHERE user_id = ? AND transaction_id = ?", (resolved_user_id, comp_id))
         comp_row = cursor.fetchone()
         comp_tx = Transaction.from_row(comp_row)
 
-        cursor.execute("SELECT * FROM transactions WHERE transaction_id = ?", (transaction_id,))
+        cursor.execute("SELECT * FROM transactions WHERE user_id = ? AND transaction_id = ?", (resolved_user_id, transaction_id))
         updated_orig_row = cursor.fetchone()
         updated_orig = Transaction.from_row(updated_orig_row)
 
-        bal = get_customer_balance(conn, orig.customer_id)
+        bal = get_customer_balance(conn, orig.customer_id, user_id=resolved_user_id)
         return {
             "reversed_transaction": updated_orig.to_dict(),
             "compensating_transaction": comp_tx.to_dict(),
@@ -353,12 +378,15 @@ def create_pending_proposal(
     amount_paise: int,
     item: Optional[str] = None,
     payment_method: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> PendingProposal:
     """
     Store an AI transaction proposal awaiting explicit merchant confirmation.
     Does NOT write to the ledger.
     """
-    _get_customer(conn, customer_id)
+    cust = _get_customer(conn, customer_id, user_id=user_id)
+    resolved_user_id = cust["user_id"]
+
     if isinstance(amount_paise, bool) or not isinstance(amount_paise, int) or amount_paise <= 0:
         raise InvalidTransactionError(f"Proposal amount must be a positive integer in paise, got {amount_paise}.")
 
@@ -375,51 +403,61 @@ def create_pending_proposal(
         cursor.execute(
             """
             INSERT INTO pending_proposals (
-                proposal_id, customer_id, intent, amount_paise, item, payment_method, status
+                proposal_id, user_id, customer_id, intent, amount_paise, item, payment_method, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
             """,
-            (proposal_id, customer_id, clean_intent, amount_paise, clean_item, clean_method),
+            (proposal_id, resolved_user_id, customer_id, clean_intent, amount_paise, clean_item, clean_method),
         )
-        cursor.execute("SELECT * FROM pending_proposals WHERE proposal_id = ?", (proposal_id,))
+        cursor.execute("SELECT * FROM pending_proposals WHERE user_id = ? AND proposal_id = ?", (resolved_user_id, proposal_id))
         row = cursor.fetchone()
         return PendingProposal.from_row(row)
 
 
-def get_pending_proposal(conn: sqlite3.Connection, proposal_id: str) -> Optional[PendingProposal]:
+def get_pending_proposal(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    user_id: Optional[int] = None,
+) -> Optional[PendingProposal]:
     """Retrieve pending proposal by proposal_id."""
+    if user_id is None:
+        user_id = getattr(conn, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pending_proposals WHERE proposal_id = ?", (proposal_id,))
+    cursor.execute("SELECT * FROM pending_proposals WHERE user_id = ? AND proposal_id = ?", (user_id, proposal_id))
     row = cursor.fetchone()
     if not row:
         return None
     return PendingProposal.from_row(row)
 
 
-def confirm_pending_proposal(conn: sqlite3.Connection, proposal_id: str) -> Dict[str, Any]:
+def confirm_pending_proposal(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     Explicit confirmation: commits a pending proposal into SQLite.
     Idempotent: repeating confirmation for the same proposal_id returns the existing
     committed transaction without duplicating entries.
     """
     with atomic(conn):
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM pending_proposals WHERE proposal_id = ?", (proposal_id,))
-        row = cursor.fetchone()
-        if not row:
+        prop = get_pending_proposal(conn, proposal_id, user_id=user_id)
+        if not prop:
             raise ProposalNotFoundError(f"Proposal '{proposal_id}' does not exist.")
 
-        prop = PendingProposal.from_row(row)
+        cursor = conn.cursor()
 
         # Idempotent replay: if already confirmed, return existing transaction
         if prop.status == "CONFIRMED" and prop.committed_transaction_id is not None:
             cursor.execute(
-                "SELECT * FROM transactions WHERE transaction_id = ?",
-                (prop.committed_transaction_id,),
+                "SELECT * FROM transactions WHERE user_id = ? AND transaction_id = ?",
+                (prop.user_id, prop.committed_transaction_id),
             )
             tx_row = cursor.fetchone()
             tx = Transaction.from_row(tx_row)
-            bal = get_customer_balance(conn, prop.customer_id)
+            bal = get_customer_balance(conn, prop.customer_id, user_id=prop.user_id)
             return {
                 "proposal_id": proposal_id,
                 "status": "CONFIRMED",
@@ -441,6 +479,7 @@ def confirm_pending_proposal(conn: sqlite3.Connection, proposal_id: str) -> Dict
                 amount_paise=prop.amount_paise,
                 item=prop.item,
                 idempotency_key=prop_key,
+                user_id=prop.user_id,
             )
         else:
             tx = record_payment(
@@ -450,18 +489,19 @@ def confirm_pending_proposal(conn: sqlite3.Connection, proposal_id: str) -> Dict
                 payment_method=prop.payment_method,
                 item=prop.item,
                 idempotency_key=prop_key,
+                user_id=prop.user_id,
             )
 
         cursor.execute(
             """
             UPDATE pending_proposals
             SET status = 'CONFIRMED', committed_transaction_id = ?
-            WHERE proposal_id = ?
+            WHERE user_id = ? AND proposal_id = ?
             """,
-            (tx.transaction_id, proposal_id),
+            (tx.transaction_id, prop.user_id, proposal_id),
         )
 
-        bal = get_customer_balance(conn, prop.customer_id)
+        bal = get_customer_balance(conn, prop.customer_id, user_id=prop.user_id)
         return {
             "proposal_id": proposal_id,
             "status": "CONFIRMED",
@@ -472,24 +512,26 @@ def confirm_pending_proposal(conn: sqlite3.Connection, proposal_id: str) -> Dict
         }
 
 
-def cancel_pending_proposal(conn: sqlite3.Connection, proposal_id: str) -> Dict[str, Any]:
+def cancel_pending_proposal(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     Cancel a pending proposal (e.g. merchant said 'Nahi, rehne do').
     """
     with atomic(conn):
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM pending_proposals WHERE proposal_id = ?", (proposal_id,))
-        row = cursor.fetchone()
-        if not row:
+        prop = get_pending_proposal(conn, proposal_id, user_id=user_id)
+        if not prop:
             raise ProposalNotFoundError(f"Proposal '{proposal_id}' does not exist.")
 
-        prop = PendingProposal.from_row(row)
         if prop.status == "CONFIRMED":
             raise InvalidTransactionError(f"Proposal '{proposal_id}' has already been confirmed and committed.")
 
+        cursor = conn.cursor()
         cursor.execute(
-            "UPDATE pending_proposals SET status = 'CANCELLED' WHERE proposal_id = ?",
-            (proposal_id,),
+            "UPDATE pending_proposals SET status = 'CANCELLED' WHERE user_id = ? AND proposal_id = ?",
+            (prop.user_id, proposal_id),
         )
         return {
             "proposal_id": proposal_id,

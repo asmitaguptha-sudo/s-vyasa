@@ -2,6 +2,7 @@
 Customer service module for Vaada Khata.
 Handles customer creation with multiple aliases, alias-aware search,
 and duplicate customer resolution with spoken clarification prompts.
+Supports multi-merchant tenant isolation with explicit user_id scoping.
 """
 
 import sqlite3
@@ -10,26 +11,34 @@ from backend.models import Customer
 from backend.schemas import CustomerCreate, CustomerLookupResponse, CustomerLookupStatus, CustomerResponse
 
 
-def get_customer_aliases(db: sqlite3.Connection, customer_id: int) -> List[str]:
+def get_customer_aliases(db: sqlite3.Connection, customer_id: int, user_id: Optional[int] = None) -> List[str]:
     """Retrieve all aliases associated with a customer ID."""
     cursor = db.cursor()
+    if user_id is None:
+        user_id = getattr(db, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
     cursor.execute(
-        "SELECT alias FROM customer_aliases WHERE customer_id = ? ORDER BY alias_id ASC",
-        (customer_id,),
+        "SELECT alias FROM customer_aliases WHERE user_id = ? AND customer_id = ? ORDER BY alias_id ASC",
+        (user_id, customer_id),
     )
     rows = cursor.fetchall()
     return [row["alias"] for row in rows]
 
 
-def get_bulk_customer_aliases(db: sqlite3.Connection, customer_ids: List[int]) -> Dict[int, List[str]]:
+def get_bulk_customer_aliases(db: sqlite3.Connection, customer_ids: List[int], user_id: Optional[int] = None) -> Dict[int, List[str]]:
     """Retrieve aliases for multiple customer IDs efficiently."""
     if not customer_ids:
         return {}
     cursor = db.cursor()
+    if user_id is None:
+        user_id = getattr(db, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
     placeholders = ",".join("?" for _ in customer_ids)
     cursor.execute(
-        f"SELECT customer_id, alias FROM customer_aliases WHERE customer_id IN ({placeholders}) ORDER BY alias_id ASC",
-        customer_ids,
+        f"SELECT customer_id, alias FROM customer_aliases WHERE user_id = ? AND customer_id IN ({placeholders}) ORDER BY alias_id ASC",
+        [user_id] + customer_ids,
     )
     rows = cursor.fetchall()
     result: Dict[int, List[str]] = {cid: [] for cid in customer_ids}
@@ -38,39 +47,54 @@ def get_bulk_customer_aliases(db: sqlite3.Connection, customer_ids: List[int]) -
     return result
 
 
-def add_customer_alias(db: sqlite3.Connection, customer_id: int, alias: str) -> bool:
+def add_customer_alias(db: sqlite3.Connection, customer_id: int, alias: str, user_id: Optional[int] = None) -> bool:
     """Add a new alias to an existing customer. Returns True if added, False if duplicate."""
     clean_alias = alias.strip()
     if not clean_alias:
         return False
+    if user_id is None:
+        user_id = getattr(db, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
+
     cursor = db.cursor()
     try:
         cursor.execute(
-            "INSERT INTO customer_aliases (customer_id, alias) VALUES (?, ?)",
-            (customer_id, clean_alias),
+            "INSERT INTO customer_aliases (user_id, customer_id, alias) VALUES (?, ?, ?)",
+            (user_id, customer_id, clean_alias),
         )
         db.commit()
         return True
     except sqlite3.IntegrityError:
-        # Alias already exists for this customer (UNIQUE constraint)
+        # Alias already exists for this customer (UNIQUE constraint) or composite FK failed
         return False
 
 
-def create_customer(db: sqlite3.Connection, customer_in: CustomerCreate) -> CustomerResponse:
+def create_customer(
+    db: sqlite3.Connection,
+    customer_in: CustomerCreate,
+    user_id: Optional[int] = None,
+) -> CustomerResponse:
     """
     Create a customer and store any provided aliases in the customer_aliases table.
-    Validates that canonical name is non-empty.
+    Validates that canonical name is non-empty. Requires explicit merchant user_id.
+    Unauthenticated customer creation without user_id is rejected.
     """
     clean_name = customer_in.name.strip()
     if not clean_name:
         raise ValueError("Customer name cannot be empty.")
 
+    if user_id is None:
+        user_id = getattr(db, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated customer creation is rejected.")
+
     clean_phone = customer_in.phone.strip() if customer_in.phone else None
 
     cursor = db.cursor()
     cursor.execute(
-        "INSERT INTO customers (name, phone) VALUES (?, ?)",
-        (clean_name, clean_phone),
+        "INSERT INTO customers (user_id, name, phone) VALUES (?, ?, ?)",
+        (user_id, clean_name, clean_phone),
     )
     customer_id = cursor.lastrowid
 
@@ -78,41 +102,58 @@ def create_customer(db: sqlite3.Connection, customer_in: CustomerCreate) -> Cust
     aliases = customer_in.get_all_aliases()
     for alias_text in aliases:
         cursor.execute(
-            "INSERT INTO customer_aliases (customer_id, alias) VALUES (?, ?)",
-            (customer_id, alias_text),
+            "INSERT INTO customer_aliases (user_id, customer_id, alias) VALUES (?, ?, ?)",
+            (user_id, customer_id, alias_text),
         )
 
     db.commit()
 
-    cursor.execute("SELECT * FROM customers WHERE customer_id = ?", (customer_id,))
+    cursor.execute("SELECT * FROM customers WHERE user_id = ? AND customer_id = ?", (user_id, customer_id))
     row = cursor.fetchone()
-    stored_aliases = get_customer_aliases(db, customer_id)
+    stored_aliases = get_customer_aliases(db, customer_id, user_id=user_id)
     customer = Customer.from_row(row, aliases=stored_aliases)
     return CustomerResponse.model_validate(customer.to_dict())
 
 
-def get_customer_by_id(db: sqlite3.Connection, customer_id: int) -> Optional[CustomerResponse]:
+def get_customer_by_id(
+    db: sqlite3.Connection,
+    customer_id: int,
+    user_id: Optional[int] = None,
+) -> Optional[CustomerResponse]:
     """Retrieve customer by their primary key, including all aliases."""
+    if user_id is None:
+        user_id = getattr(db, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM customers WHERE customer_id = ?", (customer_id,))
+    cursor.execute("SELECT * FROM customers WHERE customer_id = ? AND user_id = ?", (customer_id, user_id))
     row = cursor.fetchone()
     if not row:
         return None
-    aliases = get_customer_aliases(db, customer_id)
+    aliases = get_customer_aliases(db, customer_id, user_id=row["user_id"])
     customer = Customer.from_row(row, aliases=aliases)
     return CustomerResponse.model_validate(customer.to_dict())
 
 
-def list_customers(db: sqlite3.Connection, limit: int = 100, offset: int = 0) -> List[CustomerResponse]:
+def list_customers(
+    db: sqlite3.Connection,
+    limit: int = 100,
+    offset: int = 0,
+    user_id: Optional[int] = None,
+) -> List[CustomerResponse]:
     """Retrieve paginated list of customers with all their aliases."""
+    if user_id is None:
+        user_id = getattr(db, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
     cursor = db.cursor()
     cursor.execute(
-        "SELECT * FROM customers ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        (limit, offset),
+        "SELECT * FROM customers WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (user_id, limit, offset),
     )
     rows = cursor.fetchall()
     customer_ids = [r["customer_id"] for r in rows]
-    aliases_map = get_bulk_customer_aliases(db, customer_ids)
+    aliases_map = get_bulk_customer_aliases(db, customer_ids, user_id=user_id)
 
     result = []
     for r in rows:
@@ -147,21 +188,14 @@ def _build_clarification_prompt(candidates: List[CustomerResponse], query_name: 
     return f"Multiple customers found: {', '.join(options[:-1])} ya {options[-1]}?"
 
 
-def lookup_customer(db: sqlite3.Connection, query: str) -> CustomerLookupResponse:
+def lookup_customer(
+    db: sqlite3.Connection,
+    query: str,
+    user_id: Optional[int] = None,
+) -> CustomerLookupResponse:
     """
     Lookup customer by name or multiple aliases with intelligent duplicate resolution.
-
-    Resolution hierarchy:
-    1. Check exact canonical name match (case-insensitive).
-       - If multiple found, check if query also matches one candidate's alias to disambiguate.
-       - If still multiple: AMBIGUOUS_MATCH with candidate list and clarification prompt.
-       - If 1 found: EXACT_MATCH.
-    2. Check exact alias match in customer_aliases table.
-       - If 1 found: EXACT_MATCH.
-       - If multiple found: AMBIGUOUS_MATCH.
-    3. Check composite match where query contains name and one of their aliases (e.g. 'Auto wale Ramesh').
-    4. Check partial / substring match on canonical name or aliases.
-    5. If 0 found: NOT_FOUND.
+    Scoped by merchant user_id when provided or bound to connection.
     """
     clean_query = query.strip()
     if not clean_query:
@@ -173,17 +207,22 @@ def lookup_customer(db: sqlite3.Connection, query: str) -> CustomerLookupRespons
             clarification_prompt=None,
         )
 
+    if user_id is None:
+        user_id = getattr(db, "current_user_id", None)
+    if user_id is None:
+        raise ValueError("Merchant user_id is required. Unauthenticated operation is rejected.")
+
     cursor = db.cursor()
 
     # Step 1: Check exact canonical name match
     cursor.execute(
-        "SELECT * FROM customers WHERE LOWER(name) = LOWER(?)",
-        (clean_query,),
+        "SELECT * FROM customers WHERE user_id = ? AND LOWER(name) = LOWER(?)",
+        (user_id, clean_query),
     )
     exact_name_rows = cursor.fetchall()
     if exact_name_rows:
         customer_ids = [r["customer_id"] for r in exact_name_rows]
-        aliases_map = get_bulk_customer_aliases(db, customer_ids)
+        aliases_map = get_bulk_customer_aliases(db, customer_ids, user_id=user_id)
         exact_candidates = [
             CustomerResponse.model_validate(
                 Customer.from_row(r, aliases=aliases_map.get(r["customer_id"], [])).to_dict()
@@ -214,15 +253,15 @@ def lookup_customer(db: sqlite3.Connection, query: str) -> CustomerLookupRespons
         """
         SELECT DISTINCT c.*
         FROM customers c
-        JOIN customer_aliases ca ON ca.customer_id = c.customer_id
-        WHERE LOWER(ca.alias) = LOWER(?)
+        JOIN customer_aliases ca ON ca.user_id = c.user_id AND ca.customer_id = c.customer_id
+        WHERE c.user_id = ? AND LOWER(ca.alias) = LOWER(?)
         """,
-        (clean_query,),
+        (user_id, clean_query),
     )
     exact_alias_rows = cursor.fetchall()
     if exact_alias_rows:
         customer_ids = [r["customer_id"] for r in exact_alias_rows]
-        aliases_map = get_bulk_customer_aliases(db, customer_ids)
+        aliases_map = get_bulk_customer_aliases(db, customer_ids, user_id=user_id)
         exact_alias_candidates = [
             CustomerResponse.model_validate(
                 Customer.from_row(r, aliases=aliases_map.get(r["customer_id"], [])).to_dict()
@@ -249,10 +288,10 @@ def lookup_customer(db: sqlite3.Connection, query: str) -> CustomerLookupRespons
             )
 
     # Step 3: Check composite matches (e.g. query is 'Auto wale Ramesh' or 'Ramesh Auto wale')
-    cursor.execute("SELECT * FROM customers")
+    cursor.execute("SELECT * FROM customers WHERE user_id = ?", (user_id,))
     all_rows = cursor.fetchall()
     all_cids = [r["customer_id"] for r in all_rows]
-    all_aliases_map = get_bulk_customer_aliases(db, all_cids)
+    all_aliases_map = get_bulk_customer_aliases(db, all_cids, user_id=user_id)
     all_customers = [
         CustomerResponse.model_validate(
             Customer.from_row(r, aliases=all_aliases_map.get(r["customer_id"], [])).to_dict()
@@ -296,15 +335,15 @@ def lookup_customer(db: sqlite3.Connection, query: str) -> CustomerLookupRespons
         """
         SELECT DISTINCT c.*
         FROM customers c
-        LEFT JOIN customer_aliases ca ON ca.customer_id = c.customer_id
-        WHERE c.name LIKE ? OR ca.alias LIKE ?
+        LEFT JOIN customer_aliases ca ON ca.user_id = c.user_id AND ca.customer_id = c.customer_id
+        WHERE c.user_id = ? AND (c.name LIKE ? OR ca.alias LIKE ?)
         """,
-        (pattern, pattern),
+        (user_id, pattern, pattern),
     )
     partial_rows = cursor.fetchall()
     if partial_rows:
         customer_ids = [r["customer_id"] for r in partial_rows]
-        aliases_map = get_bulk_customer_aliases(db, customer_ids)
+        aliases_map = get_bulk_customer_aliases(db, customer_ids, user_id=user_id)
         partial_candidates = [
             CustomerResponse.model_validate(
                 Customer.from_row(r, aliases=aliases_map.get(r["customer_id"], [])).to_dict()

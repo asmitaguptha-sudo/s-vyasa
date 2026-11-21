@@ -68,6 +68,7 @@ def test_upgrade_legacy_database_preserves_records_and_migrates_aliases(legacy_d
     """
     # Run safe migrations on the legacy database
     run_migrations(legacy_db)
+    legacy_db.current_user_id = 1  # Scope post-migration reads to the legacy merchant
 
     # 1. Verify customer record is preserved
     cursor = legacy_db.cursor()
@@ -108,8 +109,8 @@ def test_upgrade_legacy_database_preserves_records_and_migrates_aliases(legacy_d
     # Add compensating reversal
     cursor.execute(
         """
-        INSERT INTO transactions (customer_id, type, amount_paise, status, reversed_transaction_id)
-        VALUES (?, 'PAYMENT', 50000, 'COMMITTED', ?)
+        INSERT INTO transactions (user_id, customer_id, type, amount_paise, status, reversed_transaction_id)
+        VALUES (1, ?, 'PAYMENT', 50000, 'COMMITTED', ?)
         """,
         (cust_row["customer_id"], tx_row["transaction_id"]),
     )
@@ -119,8 +120,8 @@ def test_upgrade_legacy_database_preserves_records_and_migrates_aliases(legacy_d
     with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise, status, reversed_transaction_id)
-            VALUES (?, 'PAYMENT', 50000, 'COMMITTED', ?)
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise, status, reversed_transaction_id)
+            VALUES (1, ?, 'PAYMENT', 50000, 'COMMITTED', ?)
             """,
             (cust_row["customer_id"], tx_row["transaction_id"]),
         )

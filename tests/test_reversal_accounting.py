@@ -17,6 +17,7 @@ def db():
     conn.executescript(SCHEMA_SQL)
     run_migrations(conn)
     conn.commit()
+    conn.current_user_id = 1
     yield conn
     conn.close()
 
@@ -48,7 +49,7 @@ def test_reversal_accounting_balance_invariant_500_500_300(db):
     Original credit ₹500 + reversal payment ₹500 + corrected credit ₹300 = outstanding ₹300.
     """
     cursor = db.cursor()
-    cursor.execute("INSERT INTO customers (name) VALUES ('Ramesh')")
+    cursor.execute("INSERT INTO customers (user_id, name) VALUES (1, 'Ramesh')")
     customer_id = cursor.lastrowid
 
     # -------------------------------------------------------------------------
@@ -56,8 +57,8 @@ def test_reversal_accounting_balance_invariant_500_500_300(db):
     # -------------------------------------------------------------------------
     cursor.execute(
         """
-        INSERT INTO transactions (customer_id, type, amount_paise, status, item)
-        VALUES (?, 'CREDIT', 50000, 'COMMITTED', 'Groceries')
+        INSERT INTO transactions (user_id, customer_id, type, amount_paise, status, item)
+        VALUES (1, ?, 'CREDIT', 50000, 'COMMITTED', 'Groceries')
         """,
         (customer_id,),
     )
@@ -77,8 +78,8 @@ def test_reversal_accounting_balance_invariant_500_500_300(db):
     )
     cursor.execute(
         """
-        INSERT INTO transactions (customer_id, type, amount_paise, status, reversed_transaction_id, item)
-        VALUES (?, 'PAYMENT', 50000, 'COMMITTED', ?, 'Reversal of entry #500')
+        INSERT INTO transactions (user_id, customer_id, type, amount_paise, status, reversed_transaction_id, item)
+        VALUES (1, ?, 'PAYMENT', 50000, 'COMMITTED', ?, 'Reversal of entry #500')
         """,
         (customer_id, t1_id),
     )
@@ -94,8 +95,8 @@ def test_reversal_accounting_balance_invariant_500_500_300(db):
     # -------------------------------------------------------------------------
     cursor.execute(
         """
-        INSERT INTO transactions (customer_id, type, amount_paise, status, item)
-        VALUES (?, 'CREDIT', 30000, 'COMMITTED', 'Corrected Groceries entry')
+        INSERT INTO transactions (user_id, customer_id, type, amount_paise, status, item)
+        VALUES (1, ?, 'CREDIT', 30000, 'COMMITTED', 'Corrected Groceries entry')
         """,
         (customer_id,),
     )
@@ -141,8 +142,8 @@ def test_reversal_accounting_balance_invariant_500_500_300(db):
     with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
         cursor.execute(
             """
-            INSERT INTO transactions (customer_id, type, amount_paise, status, reversed_transaction_id)
-            VALUES (?, 'PAYMENT', 50000, 'COMMITTED', ?)
+            INSERT INTO transactions (user_id, customer_id, type, amount_paise, status, reversed_transaction_id)
+            VALUES (1, ?, 'PAYMENT', 50000, 'COMMITTED', ?)
             """,
             (customer_id, t1_id),
         )

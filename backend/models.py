@@ -12,6 +12,7 @@ class CustomerAlias:
     alias_id: int
     customer_id: int
     alias: str
+    user_id: Optional[int] = None
     created_at: Optional[str] = None
 
     @classmethod
@@ -20,6 +21,7 @@ class CustomerAlias:
             alias_id=row["alias_id"],
             customer_id=row["customer_id"],
             alias=row["alias"],
+            user_id=row["user_id"] if "user_id" in row.keys() else None,
             created_at=row["created_at"] if "created_at" in row.keys() else None,
         )
 
@@ -28,6 +30,7 @@ class CustomerAlias:
 class Customer:
     customer_id: int
     name: str
+    user_id: Optional[int] = None
     phone: Optional[str] = None
     aliases: List[str] = field(default_factory=list)
     created_at: Optional[str] = None
@@ -37,6 +40,7 @@ class Customer:
         return cls(
             customer_id=row["customer_id"],
             name=row["name"],
+            user_id=row["user_id"] if "user_id" in row.keys() else None,
             phone=row["phone"] if "phone" in row.keys() else None,
             aliases=aliases if aliases is not None else [],
             created_at=row["created_at"] if "created_at" in row.keys() else None,
@@ -59,6 +63,7 @@ class Transaction:
     customer_id: int
     type: str  # CREDIT or PAYMENT
     amount_paise: int
+    user_id: Optional[int] = None
     item: Optional[str] = None
     payment_method: Optional[str] = None  # CASH, UPI, OTHER, or None
     transaction_date: Optional[str] = None
@@ -78,6 +83,7 @@ class Transaction:
             customer_id=row["customer_id"],
             type=row["type"],
             amount_paise=row["amount_paise"],
+            user_id=row["user_id"] if "user_id" in row.keys() else None,
             item=row["item"] if "item" in row.keys() else None,
             payment_method=row["payment_method"] if "payment_method" in row.keys() else None,
             transaction_date=row["transaction_date"] if "transaction_date" in row.keys() else None,
@@ -110,6 +116,7 @@ class Promise:
     customer_id: int
     amount_paise: int
     due_date: str
+    user_id: Optional[int] = None
     status: str = "PENDING"
     fulfilled_by_transaction_id: Optional[int] = None
     created_at: Optional[str] = None
@@ -125,6 +132,7 @@ class Promise:
             customer_id=row["customer_id"],
             amount_paise=row["amount_paise"],
             due_date=row["due_date"],
+            user_id=row["user_id"] if "user_id" in row.keys() else None,
             status=row["status"] if "status" in row.keys() else "PENDING",
             fulfilled_by_transaction_id=row["fulfilled_by_transaction_id"] if "fulfilled_by_transaction_id" in row.keys() else None,
             created_at=row["created_at"] if "created_at" in row.keys() else None,
@@ -149,6 +157,7 @@ class PendingProposal:
     customer_id: int
     intent: str
     amount_paise: int
+    user_id: Optional[int] = None
     item: Optional[str] = None
     payment_method: Optional[str] = None
     status: str = "PENDING"  # PENDING, CONFIRMED, CANCELLED
@@ -166,6 +175,7 @@ class PendingProposal:
             customer_id=row["customer_id"],
             intent=row["intent"],
             amount_paise=row["amount_paise"],
+            user_id=row["user_id"] if "user_id" in row.keys() else None,
             item=row["item"] if "item" in row.keys() else None,
             payment_method=row["payment_method"] if "payment_method" in row.keys() else None,
             status=row["status"] if "status" in row.keys() else "PENDING",
